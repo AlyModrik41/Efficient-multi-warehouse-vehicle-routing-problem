@@ -92,7 +92,7 @@ Our solver intelligently assigns orders, builds feasible routes, and minimizes o
            ↓
 ┌────────────────────────┐
 │ Retry Unassigned Orders│
-│ (3-pass adaptive fix)  │                                                                                                                                                                                                                                  
+│ (3-pass adaptive fix)  │
 └──────────┬─────────────┘
            ↓
 ┌────────────────────────┐
