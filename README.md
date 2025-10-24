@@ -64,9 +64,9 @@ Our solver intelligently assigns orders, builds feasible routes, and minimizes o
 🧮 Hackathon Scoring Formula
 
 - Scenario Score = YourScenarioCost + BenchmarkSolverCost × (100 − YourFulfillment%)
--Lower = Better
--Missing fulfillment heavily penalized
--Once fulfillment = 100%, cost optimization becomes the differentiator
+- Lower = Better
+- Missing fulfillment heavily penalized
+- Once fulfillment = 100%, cost optimization becomes the differentiator
 
 
 🧠 Solver Logic
