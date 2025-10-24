@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-MWVRP Solver: fewer vehicles, lower cost, safe routing
-- Aggressive packing: fill existing vehicles up to 95% before opening new ones
+MWVRP Solver: 100% fulfillment first, minimal cost/distance, fewer vehicles
+- Aggressive packing: fill existing vehicles before opening new ones
 - Two-phase consolidation: close lightly loaded vehicles (cuts fixed costs)
-- Distance-aware allocation capped at 2 warehouses (fewer pickup detours)
+- Distance-aware allocation (prefer 1-2 warehouses; expand only if required)
 - Road-connected routing: Dijkstra with distance caching and connectivity guards
 - Delivery sequencing: nearest-neighbor + cautious 2-opt (only for long routes)
-- Auto-tuning tries vehicle-minimizing variants and picks the best
+- Order splitting across multiple vehicles when a single vehicle cannot fit
+- Optional geographic clustering to reduce number of routes/vehicles when safe
+- Auto-tuning picks the best valid solution with heavy penalty for under-fulfillment
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from collections import defaultdict
 import heapq
 import random
@@ -22,12 +24,19 @@ def solver(env) -> Dict:
     Auto-tunes conservative parameter sets that minimize vehicles while keeping fulfillment.
     """
 
+    # Target small number of routes when feasible; always prioritize 100% fulfillment
     param_grid = [
-    {"capacity_buffer": 1.0, "max_warehouses": 2, "order_strategy": "nearest",
-     "consolidate": True, "max_orders_per_vehicle": 25, "pack_threshold": 0.99},
-    {"capacity_buffer": 1.0, "max_warehouses": 2, "order_strategy": "largest",
-     "consolidate": True, "max_orders_per_vehicle": 22, "pack_threshold": 0.98},
-]
+        {"target_routes": 6, "capacity_buffer": 1.0, "max_warehouses": 2,
+         "order_strategy": "nearest", "consolidate": True,
+         "max_orders_per_vehicle": 24, "pack_threshold": 0.99},
+        {"target_routes": 7, "capacity_buffer": 1.0, "max_warehouses": 2,
+         "order_strategy": "largest", "consolidate": True,
+         "max_orders_per_vehicle": 24, "pack_threshold": 0.99},
+        # Non-clustered fallback
+        {"target_routes": None, "capacity_buffer": 1.0, "max_warehouses": 2,
+         "order_strategy": "nearest", "consolidate": True,
+         "max_orders_per_vehicle": 25, "pack_threshold": 0.99},
+    ]
 
 
     best_solution = None
@@ -37,6 +46,7 @@ def solver(env) -> Dict:
         env.reset_all_state()
         solution = base_solver(
             env,
+            target_routes=params.get("target_routes"),
             capacity_buffer=params["capacity_buffer"],
             max_warehouses=params["max_warehouses"],
             order_strategy=params["order_strategy"],
@@ -61,8 +71,8 @@ def solver(env) -> Dict:
         delivered = stats.get("total_items_delivered", 0)
         fulfillment_rate = delivered / max(1, requested)
 
-        # Score: fulfillment first, then cost
-        score = cost * (1 + max(0.0, 1.0 - fulfillment_rate) * 60.0)
+        # Score: fulfillment must be 100%, then minimize cost
+        score = cost * (1 + max(0.0, 1.0 - fulfillment_rate) * 1000.0)
 
         if score < best_score:
             best_score = score
@@ -74,6 +84,7 @@ def solver(env) -> Dict:
 # ===================== BASE SOLVER =====================
 
 def base_solver(env,
+                target_routes: Optional[int] = None,
                 capacity_buffer: float = 1.00,
                 max_warehouses: int = 2,
                 order_strategy: str = "nearest",
@@ -107,83 +118,156 @@ def base_solver(env,
     # Track vehicle loads and assigned orders
     vehicle_loads = {v.id: {'weight': 0.0, 'volume': 0.0, 'orders': []} for v in vehicles_list}
 
-    # Order sorting (proximity or largest first)
-    order_items = list(orders.items())
-    if order_strategy == "largest":
-        order_items.sort(
-            key=lambda kv: sum(skus[s].weight * q for s, q in kv[1].requested_items.items()),
-            reverse=True
-        )
-    elif order_strategy == "nearest":
-        base_home_node = warehouses[vehicles_list[0].home_warehouse_id].location.id if vehicles_list else None
-        order_items.sort(
-            key=lambda kv: _safe_dist(env, base_home_node, kv[1].destination.id) if base_home_node is not None else 0.0
-        )
-    elif order_strategy == "random":
-        random.shuffle(order_items)
+    # Precompute reachability per vehicle to avoid assigning unreachable orders
+    reachable_nodes_by_vehicle: Dict[str, Set[int]] = {}
+    for v in vehicles_list:
+        home = warehouses[v.home_warehouse_id].location.id
+        reachable_nodes_by_vehicle[v.id] = _reachable_nodes(adjacency, home)
 
-    # Assign: pack into existing vehicles before opening new ones
-    for order_id, order in order_items:
-        order_weight = sum(skus[s].weight * q for s, q in order.requested_items.items())
-        order_volume = sum(skus[s].volume * q for s, q in order.requested_items.items())
+    # Build order sequence, optionally clustered to reduce number of routes
+    clustered_order_lists: List[List[str]] = []
+    all_order_ids = list(orders.keys())
+    if not all_order_ids:
+        return {"routes": []}
 
-        # Allocation: closest-first, capped splits
-        allocation = _find_allocation_prefer_close(order, inventory, warehouses, skus, env, max_warehouses)
-        if not allocation:
-            allocation = _find_simple_allocation(order, inventory, warehouses, skus, max_warehouses)
-        if not allocation:
-            continue
+    if target_routes and isinstance(target_routes, int) and target_routes >= 2:
+        clusters = kmeans_cluster_nodes({oid: orders[oid].destination.id for oid in all_order_ids},
+                                        k=target_routes, env=env)
+        def order_weight(oid: str) -> float:
+            return sum(skus[s].weight * q for s, q in orders[oid].requested_items.items())
 
-        # Compute utilization
-        def utilization(v_id):
-            l = vehicle_loads[v_id]; v = vehicles[v_id]
-            w_util = l['weight'] / max(1e-9, v.capacity_weight * capacity_buffer) if v.capacity_weight > 0 else 1.0
-            v_util = l['volume'] / max(1e-9, v.capacity_volume * capacity_buffer) if v.capacity_volume > 0 else 1.0
-            return max(w_util, v_util)
+        for cluster in clusters:
+            if order_strategy == "largest":
+                clustered_order_lists.append(sorted(cluster, key=order_weight, reverse=True))
+            elif order_strategy == "nearest":
+                base_home_node = warehouses[vehicles_list[0].home_warehouse_id].location.id if vehicles_list else None
+                clustered_order_lists.append(sorted(
+                    cluster,
+                    key=lambda oid: _safe_dist(env, base_home_node, orders[oid].destination.id) if base_home_node is not None else 0.0
+                ))
+            elif order_strategy == "random":
+                c = list(cluster)
+                random.shuffle(c)
+                clustered_order_lists.append(c)
+            else:
+                clustered_order_lists.append(list(cluster))
+    else:
+        order_items = list(orders.items())
+        if order_strategy == "largest":
+            order_items.sort(
+                key=lambda kv: sum(skus[s].weight * q for s, q in kv[1].requested_items.items()),
+                reverse=True
+            )
+        elif order_strategy == "nearest":
+            base_home_node = warehouses[vehicles_list[0].home_warehouse_id].location.id if vehicles_list else None
+            order_items.sort(
+                key=lambda kv: _safe_dist(env, base_home_node, kv[1].destination.id) if base_home_node is not None else 0.0
+            )
+        elif order_strategy == "random":
+            random.shuffle(order_items)
+        clustered_order_lists = [[oid for oid, _ in order_items]]
 
-        open_vehicle_ids = [vid for vid in vehicle_loads if vehicle_loads[vid]['orders']]
-        open_vehicle_ids.sort(key=lambda vid: utilization(vid), reverse=True)
+    # Assign: pack into existing vehicles before opening new ones, with safe splitting fallback
+    for cluster_orders in clustered_order_lists:
+        for order_id in cluster_orders:
+            order = orders[order_id]
+            order_weight = sum(skus[s].weight * q for s, q in order.requested_items.items())
+            order_volume = sum(skus[s].volume * q for s, q in order.requested_items.items())
 
-        assigned_vehicle = None
-
-        # Pass 1: pack into open vehicles under pack_threshold and cap on number of orders
-        for vid in open_vehicle_ids:
-            l = vehicle_loads[vid]
-            if len(l['orders']) >= max_orders_per_vehicle:
+            # Allocation: prefer closest limited to few warehouses
+            allocation = _find_allocation_prefer_close(order, inventory, warehouses, skus, env, max_warehouses)
+            if not allocation:
+                allocation = _find_simple_allocation(order, inventory, warehouses, skus, max_warehouses)
+            # Last resort: allow more warehouses if absolutely necessary to fulfill
+            if not allocation:
+                allocation = _find_allocation_any(order, inventory, warehouses, env)
+            if not allocation:
+                # Cannot fulfill due to inventory shortage
                 continue
-            v = vehicles[vid]
-            w_util = l['weight'] / max(1e-9, v.capacity_weight * capacity_buffer) if v.capacity_weight > 0 else 1.0
-            v_util = l['volume'] / max(1e-9, v.capacity_volume * capacity_buffer) if v.capacity_volume > 0 else 1.0
-            if w_util > pack_threshold or v_util > pack_threshold:
-                continue
-            if (l['weight'] + order_weight <= v.capacity_weight * capacity_buffer and
-                l['volume'] + order_volume <= v.capacity_volume * capacity_buffer):
-                assigned_vehicle = vid
-                break
 
-        # Pass 2: open the cheapest feasible vehicle
-        if assigned_vehicle is None:
-            for v in vehicles_list:
-                l = vehicle_loads[v.id]
-                if len(l['orders']) >= max_orders_per_vehicle:
+            # Utilization helper
+            def utilization(v_id):
+                l = vehicle_loads[v_id]; v = vehicles[v_id]
+                w_util = l['weight'] / max(1e-9, v.capacity_weight * capacity_buffer) if v.capacity_weight > 0 else 1.0
+                v_util = l['volume'] / max(1e-9, v.capacity_volume * capacity_buffer) if v.capacity_volume > 0 else 1.0
+                return max(w_util, v_util)
+
+            # Vehicles already open, most utilized first
+            open_vehicle_ids = [vid for vid in vehicle_loads if vehicle_loads[vid]['orders']]
+            open_vehicle_ids.sort(key=lambda vid: utilization(vid), reverse=True)
+
+            assigned_vehicle = None
+
+            # Pass 1: pack full order into open vehicles (connectivity-aware)
+            for vid in open_vehicle_ids:
+                l = vehicle_loads[vid]
+                v = vehicles[vid]
+                # Respect order cap only if this order isn't already on the vehicle
+                has_this_order = any(oid == order_id for oid, _ in l['orders'])
+                if not has_this_order and len(l['orders']) >= max_orders_per_vehicle:
+                    continue
+                # Connectivity: vehicle must reach order destination
+                if orders[order_id].destination.id not in reachable_nodes_by_vehicle[vid]:
                     continue
                 if (l['weight'] + order_weight <= v.capacity_weight * capacity_buffer and
                     l['volume'] + order_volume <= v.capacity_volume * capacity_buffer):
-                    assigned_vehicle = v.id
+                    assigned_vehicle = vid
                     break
 
-        if assigned_vehicle is None:
-            continue
+            # Pass 2: open the cheapest feasible vehicle (connectivity-aware)
+            if assigned_vehicle is None:
+                for v in vehicles_list:
+                    l = vehicle_loads[v.id]
+                    # Vehicle must reach order destination
+                    if orders[order_id].destination.id not in reachable_nodes_by_vehicle[v.id]:
+                        continue
+                    if len(l['orders']) >= max_orders_per_vehicle:
+                        continue
+                    if (l['weight'] + order_weight <= v.capacity_weight * capacity_buffer and
+                        l['volume'] + order_volume <= v.capacity_volume * capacity_buffer):
+                        assigned_vehicle = v.id
+                        break
 
-        # Accept
-        vehicle_loads[assigned_vehicle]['weight'] += order_weight
-        vehicle_loads[assigned_vehicle]['volume'] += order_volume
-        vehicle_loads[assigned_vehicle]['orders'].append((order_id, allocation))
+            if assigned_vehicle is not None:
+                # Ensure all pickup warehouses are reachable by this vehicle; otherwise, fallback to split path
+                all_reachable = True
+                for wh_id, _ in allocation:
+                    wh_node = warehouses[wh_id].location.id
+                    if wh_node not in reachable_nodes_by_vehicle[assigned_vehicle]:
+                        all_reachable = False
+                        break
+                if not all_reachable:
+                    assigned_vehicle = None
 
-        # Update inventory
-        for wh_id, items in allocation:
-            for sku_id, qty in items.items():
-                inventory[wh_id][sku_id] -= qty
+            if assigned_vehicle is not None:
+                # Accept full order on one vehicle
+                vehicle_loads[assigned_vehicle]['weight'] += order_weight
+                vehicle_loads[assigned_vehicle]['volume'] += order_volume
+                vehicle_loads[assigned_vehicle]['orders'].append((order_id, allocation))
+                # Update inventory for full allocation
+                for wh_id, items in allocation:
+                    for sku_id, qty in items.items():
+                        inventory[wh_id][sku_id] -= qty
+                continue
+
+            # Pass 3: split across multiple vehicles safely (merge per-vehicle entry)
+            remaining_items = dict(order.requested_items)
+            success_split = _assign_order_split_across_vehicles(
+                order_id=order_id,
+                remaining_items=remaining_items,
+                inventory=inventory,
+                warehouses=warehouses,
+                skus=skus,
+                env=env,
+                vehicles_list=vehicles_list,
+                vehicle_loads=vehicle_loads,
+                capacity_buffer=capacity_buffer,
+                max_orders_per_vehicle=max_orders_per_vehicle,
+                max_warehouses=max_warehouses,
+                reachable_nodes_by_vehicle=reachable_nodes_by_vehicle,
+                dest_node=orders[order_id].destination.id,
+            )
+            # If splitting failed, leave unassigned (will be penalized and not selected by auto-tuner)
 
     # Consolidate to reduce vehicles/routes
     if consolidate:
@@ -280,10 +364,9 @@ def consolidate_small_fleets(vehicles_list, vehicle_loads, orders, skus,
                 if recipient.id == donor.id:
                     continue
                 r_load = vehicle_loads[recipient.id]
-                if (r_load['weight'] + o_weight <= recipient.capacity_weight * capacity_buffer * 1.5 and
-    r_load['volume'] + o_volume <= recipient.capacity_volume * capacity_buffer * 1.5):
-    # move order
-
+                if (r_load['weight'] + o_weight <= recipient.capacity_weight * capacity_buffer and
+                    r_load['volume'] + o_volume <= recipient.capacity_volume * capacity_buffer):
+                    # move order
                     r_load['orders'].append((oid, alloc))
                     r_load['weight'] += o_weight
                     r_load['volume'] += o_volume
@@ -390,6 +473,344 @@ def _find_allocation_prefer_close(order, inventory, warehouses, skus, env, max_w
             return allocation
 
     return allocation if not remaining else []
+
+
+def _find_allocation_any(order, inventory, warehouses, env):
+    """
+    Last-resort allocator: split across any number of warehouses (closest-first) to fulfill order.
+    """
+    needed = dict(order.requested_items)
+    customer_node = order.destination.id
+
+    # Warehouses by proximity
+    wh_order = []
+    for wh_id, inv in inventory.items():
+        wh_node = warehouses[wh_id].location.id
+        dist = _safe_dist(env, wh_node, customer_node)
+        wh_order.append((dist, wh_id))
+    wh_order.sort()
+
+    allocation, remaining = [], dict(needed)
+    for _, wh_id in wh_order:
+        inv = inventory[wh_id]
+        provided = {}
+        to_delete = []
+        for sku_id, qty_needed in list(remaining.items()):
+            available = inv.get(sku_id, 0)
+            if available <= 0:
+                continue
+            take = min(available, qty_needed)
+            if take > 0:
+                provided[sku_id] = take
+                new_qty = qty_needed - take
+                if new_qty <= 0:
+                    to_delete.append(sku_id)
+                else:
+                    remaining[sku_id] = new_qty
+        for sid in to_delete:
+            del remaining[sid]
+        if provided:
+            allocation.append((wh_id, provided))
+        if not remaining:
+            return allocation
+
+    return allocation if not remaining else []
+
+
+def _reachable_nodes(adjacency: Dict[int, List[int]], start: int) -> Set[int]:
+    visited: Set[int] = set()
+    stack = [start]
+    while stack:
+        u = stack.pop()
+        if u in visited:
+            continue
+        visited.add(u)
+        for v in adjacency.get(u, []):
+            if v not in visited:
+                stack.append(v)
+    return visited
+
+
+def _assign_order_split_across_vehicles(
+    order_id: str,
+    remaining_items: Dict[str, int],
+    inventory: Dict[str, Dict[str, int]],
+    warehouses,
+    skus,
+    env,
+    vehicles_list,
+    vehicle_loads,
+    capacity_buffer: float,
+    max_orders_per_vehicle: int,
+    max_warehouses: int,
+    reachable_nodes_by_vehicle: Dict[str, Set[int]],
+    dest_node: int,
+) -> bool:
+    """
+    Split an oversized order across multiple vehicles, merging per-vehicle entries to avoid duplicates.
+    Returns True if the entire order was assigned, False otherwise.
+    """
+
+    def vehicle_can_take_any(vid: str) -> bool:
+        load = vehicle_loads[vid]
+        # Allow adding if this vehicle already has this order, else respect cap
+        has_this_order = any(oid == order_id for oid, _ in load['orders'])
+        return has_this_order or (len(load['orders']) < max_orders_per_vehicle)
+
+    # First try open vehicles, then remaining vehicles
+    candidate_vids = [v.id for v in vehicles_list if vehicle_loads[v.id]['orders']]
+    candidate_vids += [v.id for v in vehicles_list if not vehicle_loads[v.id]['orders']]
+
+    while remaining_items:
+        progress = False
+        for vid in candidate_vids:
+            v = next(vv for vv in vehicles_list if vv.id == vid)
+            # Connectivity: order destination must be reachable by this vehicle
+            if dest_node not in reachable_nodes_by_vehicle[vid]:
+                continue
+            # Respect order cap
+            if not vehicle_can_take_any(vid):
+                continue
+            # Build a partial chunk limited by vehicle remaining capacity and max_warehouses
+            chunk = _allocate_partial_for_vehicle(
+                order_id=order_id,
+                remaining_items=remaining_items,
+                inventory=inventory,
+                warehouses=warehouses,
+                skus=skus,
+                env=env,
+                vehicle=v,
+                vehicle_load=vehicle_loads[vid],
+                capacity_buffer=capacity_buffer,
+                max_warehouses=max_warehouses,
+                reachable_nodes=reachable_nodes_by_vehicle[vid],
+                dest_node=dest_node,
+            )
+            if not chunk:
+                continue
+
+            # Merge chunk into vehicle's orders list (ensure single entry per order_id)
+            load = vehicle_loads[vid]
+            found_index = None
+            for idx, (oid, _) in enumerate(load['orders']):
+                if oid == order_id:
+                    found_index = idx
+                    break
+            if found_index is None:
+                load['orders'].append((order_id, chunk['allocation']))
+            else:
+                # Merge into existing allocation
+                existing_alloc = load['orders'][found_index][1]
+                merged = _merge_allocations(existing_alloc, chunk['allocation'])
+                load['orders'][found_index] = (order_id, merged)
+
+            # Update load totals
+            load['weight'] += chunk['weight']
+            load['volume'] += chunk['volume']
+
+            # Update inventory and remaining items
+            for wh_id, items in chunk['allocation']:
+                for sku_id, qty in items.items():
+                    inventory[wh_id][sku_id] -= qty
+                    remaining_qty = remaining_items.get(sku_id, 0)
+                    if remaining_qty > 0:
+                        new_qty = remaining_qty - qty
+                        if new_qty > 0:
+                            remaining_items[sku_id] = new_qty
+                        else:
+                            del remaining_items[sku_id]
+
+            progress = True
+            if not remaining_items:
+                break
+
+        if not progress:
+            break
+
+    return len(remaining_items) == 0
+
+
+def _allocate_partial_for_vehicle(
+    order_id: str,
+    remaining_items: Dict[str, int],
+    inventory: Dict[str, Dict[str, int]],
+    warehouses,
+    skus,
+    env,
+    vehicle,
+    vehicle_load,
+    capacity_buffer: float,
+    max_warehouses: int,
+    reachable_nodes: Set[int],
+    dest_node: int,
+) -> Optional[Dict]:
+    """
+    Build a per-vehicle allocation chunk limited by remaining capacity and warehouses.
+    Returns dict with keys: 'allocation' (list of (wh_id, items)), 'weight', 'volume'.
+    Warehouses and order destination must be reachable from vehicle home.
+    """
+    # Remaining capacity
+    rem_w = float('inf') if vehicle.capacity_weight <= 0 else vehicle.capacity_weight * capacity_buffer - vehicle_load['weight']
+    rem_v = float('inf') if vehicle.capacity_volume <= 0 else vehicle.capacity_volume * capacity_buffer - vehicle_load['volume']
+    if rem_w <= 1e-9 and rem_v <= 1e-9:
+        return None
+
+    # Build warehouse order by proximity to this order's destination, filtered by reachability
+    wh_order = []
+    for wh_id, inv in inventory.items():
+        wh_node = warehouses[wh_id].location.id
+        if wh_node not in reachable_nodes:
+            continue
+        d = _safe_dist(env, wh_node, dest_node)
+        wh_order.append((d, wh_id))
+    # If none reachable, cannot allocate
+    if not wh_order:
+        return None
+    wh_order.sort()
+
+    allocation: List[Tuple[str, Dict[str, int]]] = []
+    used_wh = 0
+    weight_sum = 0.0
+    volume_sum = 0.0
+
+    # Iterate warehouses by preference
+    for _, wh_id in wh_order:
+        if used_wh >= max_warehouses:
+            break
+        inv = inventory[wh_id]
+        provided: Dict[str, int] = {}
+        # Greedily allocate SKUs limited by remaining capacity
+        for sku_id, qty_needed in list(remaining_items.items()):
+            if qty_needed <= 0:
+                continue
+            available = inv.get(sku_id, 0)
+            if available <= 0:
+                continue
+            w_unit = skus[sku_id].weight if skus[sku_id].weight > 0 else 0.0
+            v_unit = skus[sku_id].volume if skus[sku_id].volume > 0 else 0.0
+
+            # Compute capacity-limited max quantity
+            max_by_weight = qty_needed
+            if w_unit > 0 and rem_w < float('inf'):
+                max_by_weight = min(max_by_weight, int(rem_w // w_unit) if w_unit > 0 else qty_needed)
+            max_by_volume = qty_needed
+            if v_unit > 0 and rem_v < float('inf'):
+                max_by_volume = min(max_by_volume, int(rem_v // v_unit) if v_unit > 0 else qty_needed)
+
+            can_take = min(qty_needed, available, max_by_weight, max_by_volume)
+            if can_take <= 0:
+                continue
+
+            provided[sku_id] = can_take
+            take_w = w_unit * can_take
+            take_v = v_unit * can_take
+            if rem_w < float('inf'):
+                rem_w -= take_w
+            if rem_v < float('inf'):
+                rem_v -= take_v
+            weight_sum += take_w
+            volume_sum += take_v
+
+            # If capacity nearly exhausted, stop
+            if (rem_w <= 1e-6 and rem_v <= 1e-6):
+                break
+
+        if provided:
+            allocation.append((wh_id, provided))
+            used_wh += 1
+
+        # If capacity is exhausted, stop
+        if (rem_w <= 1e-6 and rem_v <= 1e-6):
+            break
+
+    if not allocation:
+        return None
+
+    return {"allocation": allocation, "weight": weight_sum, "volume": volume_sum}
+
+
+def _merge_allocations(base_alloc: List[Tuple[str, Dict[str, int]]],
+                       add_alloc: List[Tuple[str, Dict[str, int]]]) -> List[Tuple[str, Dict[str, int]]]:
+    merged: Dict[str, Dict[str, int]] = {}
+    for wh_id, items in base_alloc:
+        merged.setdefault(wh_id, {})
+        for sku_id, qty in items.items():
+            merged[wh_id][sku_id] = merged[wh_id].get(sku_id, 0) + qty
+    for wh_id, items in add_alloc:
+        merged.setdefault(wh_id, {})
+        for sku_id, qty in items.items():
+            merged[wh_id][sku_id] = merged[wh_id].get(sku_id, 0) + qty
+    return [(wh_id, items) for wh_id, items in merged.items()]
+
+
+def kmeans_cluster_nodes(order_nodes: Dict[str, int], k: int, env) -> List[List[str]]:
+    """
+    Simple k-means/medoids on order destination nodes using pairwise distances (Lloyd's style).
+    Returns up to k clusters of order IDs. If k >= number of orders, returns singleton clusters.
+    """
+    oids = list(order_nodes.keys())
+    n = len(oids)
+    if k is None or k <= 1 or k >= n:
+        return [[oid] for oid in oids]
+
+    # Initialize centers using evenly spaced samples
+    step = max(1, n // k)
+    centers = [order_nodes[oid] for oid in oids[::step][:k]]
+
+    def dist(a_node: int, b_node: int) -> float:
+        d = env.get_distance(a_node, b_node)
+        return d if d is not None else float('inf')
+
+    for _ in range(8):  # few iterations for speed
+        clusters = [[] for _ in range(k)]
+        # Assign
+        for oid in oids:
+            onode = order_nodes[oid]
+            best_i = 0
+            best_d = dist(onode, centers[0])
+            for i in range(1, k):
+                di = dist(onode, centers[i])
+                if di < best_d:
+                    best_i, best_d = i, di
+            clusters[best_i].append(oid)
+
+        # Recompute centers as medoids
+        new_centers: List[int] = []
+        for i in range(k):
+            cluster = clusters[i]
+            if not cluster:
+                new_centers.append(centers[i])
+                continue
+            nodes = [order_nodes[oid] for oid in cluster]
+            best_node, best_sum = nodes[0], float('inf')
+            for nnode in nodes:
+                s = 0.0
+                for mnode in nodes:
+                    s += dist(nnode, mnode)
+                if s < best_sum:
+                    best_sum = s
+                    best_node = nnode
+            new_centers.append(best_node)
+
+        if all(new_centers[i] == centers[i] for i in range(k)):
+            centers = new_centers
+            break
+        centers = new_centers
+
+    # Final assignment
+    clusters = [[] for _ in range(k)]
+    for oid in oids:
+        onode = order_nodes[oid]
+        best_i = 0
+        best_d = dist(onode, centers[0])
+        for i in range(1, k):
+            di = dist(onode, centers[i])
+            if di < best_d:
+                best_i, best_d = i, di
+        clusters[best_i].append(oid)
+
+    # Remove empties
+    return [c for c in clusters if c]
 
 
 def _build_connected_route(env,
