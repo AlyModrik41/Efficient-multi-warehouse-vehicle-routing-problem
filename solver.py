@@ -1,68 +1,91 @@
 #!/usr/bin/env python3
 """
-MWVRP Solver: fewer vehicles, lower cost, safe routing
-- Aggressive packing: fill existing vehicles up to 95% before opening new ones
-- Two-phase consolidation: close lightly loaded vehicles (cuts fixed costs)
-- Distance-aware allocation capped at 2 warehouses (fewer pickup detours)
-- Road-connected routing: Dijkstra with distance caching and connectivity guards
-- Delivery sequencing: nearest-neighbor + cautious 2-opt (only for long routes)
-- Auto-tuning tries vehicle-minimizing variants and picks the best
+MWVRP Solver with road-connected routing + auto-tuning
+- Greedy order assignment (simple but fast)
+- Multi-warehouse allocation (up to N warehouses per order)
+- Dijkstra shortest paths between waypoints
+- One route per vehicle; starts/ends at home depot
+- Auto-tuning loop tries multiple parameter sets and picks the best
 """
 
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
-import heapq
-import random
+import heapq, random
 
 
-# ===================== ENTRY POINT =====================
+# ------------------- ENTRY POINT -------------------
 
 def solver(env) -> Dict:
     """
-    Auto-tunes conservative parameter sets that minimize vehicles while keeping fulfillment.
+    Entry point required by hackathon.
+    Runs auto-tuning loop over parameter sets and picks best solution.
     """
 
     param_grid = [
-    {"capacity_buffer": 1.0, "max_warehouses": 2, "order_strategy": "nearest",
-     "consolidate": True, "max_orders_per_vehicle": 25, "pack_threshold": 0.99},
-    {"capacity_buffer": 1.0, "max_warehouses": 2, "order_strategy": "largest",
-     "consolidate": True, "max_orders_per_vehicle": 22, "pack_threshold": 0.98},
-]
-
+        {"capacity_buffer": 0.95, "max_warehouses": 1, "order_strategy": "largest"},
+        {"capacity_buffer": 0.90, "max_warehouses": 2, "order_strategy": "smallest"},
+        {"capacity_buffer": 1.00, "max_warehouses": 2, "order_strategy": "random"},
+    ]
 
     best_solution = None
     best_score = float("inf")
 
     for params in param_grid:
         env.reset_all_state()
-        solution = base_solver(
-            env,
-            capacity_buffer=params["capacity_buffer"],
-            max_warehouses=params["max_warehouses"],
-            order_strategy=params["order_strategy"],
-            max_orders_per_vehicle=params["max_orders_per_vehicle"],
-            pack_threshold=params["pack_threshold"],
-            consolidate=params["consolidate"],
-        )
 
-        # Validate
+        solution = base_solver(env,
+                               capacity_buffer=params["capacity_buffer"],
+                               max_warehouses=params["max_warehouses"],
+                               order_strategy=params["order_strategy"])
+
         validation_result = env.validate_solution_complete(solution)
-        if isinstance(validation_result, bool):
-            if not validation_result:
-                continue
-        elif isinstance(validation_result, dict):
-            if not validation_result.get("is_valid", True):
-                continue
 
-        # Metrics
+# If it’s a boolean:
+        if isinstance(validation_result, bool):
+          if not validation_result:
+            continue
+
+# If it’s a dict with an "is_valid" key:
+        elif isinstance(validation_result, dict):
+          if not validation_result.get("is_valid", True):
+            continue
+
+
         cost = env.calculate_solution_cost(solution)
+        fulfillment = env.get_solution_fulfillment_summary(solution)
+
+        requested, delivered = 0, 0
+
+# Case 1: top-level dict with "requested"/"delivered"
+        if "requested" in fulfillment and "delivered" in fulfillment:
+    # values are already dicts or ints
+          if isinstance(fulfillment["requested"], dict):
+            requested = sum(fulfillment["requested"].values())
+          else:
+            requested = int(fulfillment["requested"])
+          if isinstance(fulfillment["delivered"], dict):
+            delivered = sum(fulfillment["delivered"].values())
+          else:
+            delivered = int(fulfillment["delivered"])
+
+# Case 2: per-order dict with ints
+        else:
+          for _oid, f in fulfillment.items():
+        # f might itself be a dict or just an int
+            if isinstance(f, dict):
+              requested += sum(f.get("requested", {}).values()) if isinstance(f.get("requested"), dict) else int(f.get("requested", 0))
+              delivered += sum(f.get("delivered", {}).values()) if isinstance(f.get("delivered"), dict) else int(f.get("delivered", 0))
+            elif isinstance(f, int):
+            # if it's just an int, treat it as requested count
+              requested += f
+
         stats = env.get_solution_statistics(solution)
         requested = stats.get("total_items_requested", 0)
         delivered = stats.get("total_items_delivered", 0)
         fulfillment_rate = delivered / max(1, requested)
 
-        # Score: fulfillment first, then cost
-        score = cost * (1 + max(0.0, 1.0 - fulfillment_rate) * 60.0)
+        # Hackathon scoring equation approximation (lower is better)
+        score = cost + cost * (100 - (fulfillment_rate * 100))
 
         if score < best_score:
             best_score = score
@@ -71,237 +94,97 @@ def solver(env) -> Dict:
     return best_solution if best_solution else {"routes": []}
 
 
-# ===================== BASE SOLVER =====================
+# ------------------- BASE SOLVER -------------------
 
-def base_solver(env,
-                capacity_buffer: float = 1.00,
-                max_warehouses: int = 2,
-                order_strategy: str = "nearest",
-                max_orders_per_vehicle: int = 18,
-                pack_threshold: float = 0.95,
-                consolidate: bool = True) -> Dict:
+def base_solver(env, capacity_buffer=0.95, max_warehouses=2, order_strategy="largest") -> Dict:
     """
-    Vehicle-minimizing greedy solver with consolidation and optimized routing.
+    Greedy solver with road-connected routing.
+    Parameters:
+        capacity_buffer: fraction of vehicle capacity to allow
+        max_warehouses: maximum warehouses to split an order across
+        order_strategy: 'largest', 'smallest', or 'random'
     """
 
     orders = env.orders
+    vehicles = {v.id: v for v in env.get_all_vehicles()}
     warehouses = env.warehouses
     skus = env.skus
-
-    # Vehicles sorted by economics (cheapest first)
-    vehicles_list = env.get_all_vehicles()
-    def _vehicle_total_cost_metric(v):
-        fixed = getattr(v, "fixed_cost", 0.0)
-        per_km = getattr(v, "cost_per_km", getattr(v, "variable_cost_per_km", 0.0))
-        return fixed + per_km
-    vehicles_list.sort(key=_vehicle_total_cost_metric)
-    vehicles = {v.id: v for v in vehicles_list}
-
-    # Road graph
     graph = env.get_road_network_data()
     adjacency = graph.get('adjacency_list', {})
 
     # Shadow inventory
     inventory = {wid: dict(wh.inventory) for wid, wh in warehouses.items()}
 
-    # Track vehicle loads and assigned orders
-    vehicle_loads = {v.id: {'weight': 0.0, 'volume': 0.0, 'orders': []} for v in vehicles_list}
+    # Track vehicle aggregate loads and assigned orders
+    vehicle_loads = {vid: {'weight': 0.0, 'volume': 0.0, 'orders': []}
+                     for vid in vehicles.keys()}
 
-    # Order sorting (proximity or largest first)
+    # Order sorting strategy
     order_items = list(orders.items())
     if order_strategy == "largest":
         order_items.sort(
             key=lambda kv: sum(skus[s].weight * q for s, q in kv[1].requested_items.items()),
             reverse=True
         )
-    elif order_strategy == "nearest":
-        base_home_node = warehouses[vehicles_list[0].home_warehouse_id].location.id if vehicles_list else None
+    elif order_strategy == "smallest":
         order_items.sort(
-            key=lambda kv: _safe_dist(env, base_home_node, kv[1].destination.id) if base_home_node is not None else 0.0
+            key=lambda kv: sum(skus[s].weight * q for s, q in kv[1].requested_items.items())
         )
     elif order_strategy == "random":
         random.shuffle(order_items)
 
-    # Assign: pack into existing vehicles before opening new ones
+    # Assign orders greedily
     for order_id, order in order_items:
         order_weight = sum(skus[s].weight * q for s, q in order.requested_items.items())
         order_volume = sum(skus[s].volume * q for s, q in order.requested_items.items())
 
-        # Allocation: closest-first, capped splits
-        allocation = _find_allocation_prefer_close(order, inventory, warehouses, skus, env, max_warehouses)
-        if not allocation:
-            allocation = _find_simple_allocation(order, inventory, warehouses, skus, max_warehouses)
+        allocation = _find_simple_allocation(order, inventory, warehouses, skus, max_warehouses)
         if not allocation:
             continue
 
-        # Compute utilization
-        def utilization(v_id):
-            l = vehicle_loads[v_id]; v = vehicles[v_id]
-            w_util = l['weight'] / max(1e-9, v.capacity_weight * capacity_buffer) if v.capacity_weight > 0 else 1.0
-            v_util = l['volume'] / max(1e-9, v.capacity_volume * capacity_buffer) if v.capacity_volume > 0 else 1.0
-            return max(w_util, v_util)
-
-        open_vehicle_ids = [vid for vid in vehicle_loads if vehicle_loads[vid]['orders']]
-        open_vehicle_ids.sort(key=lambda vid: utilization(vid), reverse=True)
-
         assigned_vehicle = None
-
-        # Pass 1: pack into open vehicles under pack_threshold and cap on number of orders
-        for vid in open_vehicle_ids:
-            l = vehicle_loads[vid]
-            if len(l['orders']) >= max_orders_per_vehicle:
-                continue
-            v = vehicles[vid]
-            w_util = l['weight'] / max(1e-9, v.capacity_weight * capacity_buffer) if v.capacity_weight > 0 else 1.0
-            v_util = l['volume'] / max(1e-9, v.capacity_volume * capacity_buffer) if v.capacity_volume > 0 else 1.0
-            if w_util > pack_threshold or v_util > pack_threshold:
-                continue
-            if (l['weight'] + order_weight <= v.capacity_weight * capacity_buffer and
-                l['volume'] + order_volume <= v.capacity_volume * capacity_buffer):
+        for vid, vehicle in vehicles.items():
+            load = vehicle_loads[vid]
+            if (load['weight'] + order_weight <= vehicle.capacity_weight * capacity_buffer and
+                load['volume'] + order_volume <= vehicle.capacity_volume * capacity_buffer):
                 assigned_vehicle = vid
                 break
 
-        # Pass 2: open the cheapest feasible vehicle
-        if assigned_vehicle is None:
-            for v in vehicles_list:
-                l = vehicle_loads[v.id]
-                if len(l['orders']) >= max_orders_per_vehicle:
-                    continue
-                if (l['weight'] + order_weight <= v.capacity_weight * capacity_buffer and
-                    l['volume'] + order_volume <= v.capacity_volume * capacity_buffer):
-                    assigned_vehicle = v.id
-                    break
-
         if assigned_vehicle is None:
             continue
 
-        # Accept
         vehicle_loads[assigned_vehicle]['weight'] += order_weight
         vehicle_loads[assigned_vehicle]['volume'] += order_volume
         vehicle_loads[assigned_vehicle]['orders'].append((order_id, allocation))
 
-        # Update inventory
+        # Update shadow inventory
         for wh_id, items in allocation:
             for sku_id, qty in items.items():
                 inventory[wh_id][sku_id] -= qty
 
-    # Consolidate to reduce vehicles/routes
-    if consolidate:
-        vehicle_loads = consolidate_vehicles(vehicles_list, vehicle_loads, orders, skus, capacity_buffer)
-        vehicle_loads = consolidate_small_fleets(vehicles_list, vehicle_loads, orders, skus,
-                                                 capacity_buffer, max_orders_threshold=3)
-
-    # Build connected routes
+    # Build physically connected routes
     solution = {"routes": []}
-    for v in vehicles_list:
-        info = vehicle_loads[v.id]
+    for vid, info in vehicle_loads.items():
         if not info['orders']:
             continue
-        route = _build_connected_route(env, v, info['orders'], warehouses, orders, adjacency)
-        if route and route.get('steps'):
+        vehicle = vehicles[vid]
+        route = _build_connected_route(env, vehicle, info['orders'], warehouses, orders, adjacency)
+        if route:
             solution["routes"].append(route)
 
     return solution
 
 
-# ===================== HELPERS =====================
-
-def _safe_dist(env, u: Optional[int], v: Optional[int]) -> float:
-    if u is None or v is None:
-        return float('inf')
-    w = env.get_distance(u, v)
-    return w if (w is not None) else float('inf')
-
-
-def consolidate_vehicles(vehicles_list, vehicle_loads, orders, skus, capacity_buffer=1.0):
-    """
-    Move smallest orders from lightly loaded vehicles into other vehicles (if feasible)
-    to reduce the number of active vehicles and cut fixed costs.
-    """
-    def util(v):
-        l = vehicle_loads[v.id]
-        w_util = l['weight'] / max(1e-9, v.capacity_weight * capacity_buffer) if v.capacity_weight > 0 else 1.0
-        v_util = l['volume'] / max(1e-9, v.capacity_volume * capacity_buffer) if v.capacity_volume > 0 else 1.0
-        return max(w_util, v_util)
-
-    sorted_by_util = sorted(vehicles_list, key=util)  # donors first
-
-    for donor in sorted_by_util:
-        donor_load = vehicle_loads[donor.id]
-        if not donor_load['orders']:
-            continue
-
-        donor_orders_sorted = sorted(
-            donor_load['orders'],
-            key=lambda ov: sum(skus[s].weight * q for s, q in orders[ov[0]].requested_items.items())
-        )
-
-        for (oid, alloc) in donor_orders_sorted:
-            o = orders[oid]
-            o_weight = sum(skus[s].weight * q for s, q in o.requested_items.items())
-            o_volume = sum(skus[s].volume * q for s, q in o.requested_items.items())
-
-            # Move into recipient if feasible
-            for recipient in vehicles_list:
-                if recipient.id == donor.id:
-                    continue
-                r_load = vehicle_loads[recipient.id]
-                if (r_load['weight'] + o_weight <= recipient.capacity_weight * capacity_buffer and
-                    r_load['volume'] + o_volume <= recipient.capacity_volume * capacity_buffer):
-                    r_load['orders'].append((oid, alloc))
-                    r_load['weight'] += o_weight
-                    r_load['volume'] += o_volume
-                    donor_load['orders'] = [x for x in donor_load['orders'] if x[0] != oid]
-                    donor_load['weight'] -= o_weight
-                    donor_load['volume'] -= o_volume
-                    break  # next order
-
-    return vehicle_loads
-
-
-def consolidate_small_fleets(vehicles_list, vehicle_loads, orders, skus,
-                             capacity_buffer=1.0, max_orders_threshold=3):
-    """
-    Close vehicles with few orders (<= threshold) by moving their orders to other vehicles.
-    """
-    donors = [v for v in vehicles_list if len(vehicle_loads[v.id]['orders']) <= max_orders_threshold
-              and vehicle_loads[v.id]['orders']]
-
-    for donor in donors:
-        donor_load = vehicle_loads[donor.id]
-        donor_orders = list(donor_load['orders'])  # copy
-
-        for (oid, alloc) in donor_orders:
-            o = orders[oid]
-            o_weight = sum(skus[s].weight * q for s, q in o.requested_items.items())
-            o_volume = sum(skus[s].volume * q for s, q in o.requested_items.items())
-
-            for recipient in vehicles_list:
-                if recipient.id == donor.id:
-                    continue
-                r_load = vehicle_loads[recipient.id]
-                if (r_load['weight'] + o_weight <= recipient.capacity_weight * capacity_buffer * 1.5 and
-    r_load['volume'] + o_volume <= recipient.capacity_volume * capacity_buffer * 1.5):
-    # move order
-
-                    r_load['orders'].append((oid, alloc))
-                    r_load['weight'] += o_weight
-                    r_load['volume'] += o_volume
-                    donor_load['orders'] = [x for x in donor_load['orders'] if x[0] != oid]
-                    donor_load['weight'] -= o_weight
-                    donor_load['volume'] -= o_volume
-                    break  # next order
-
-    return vehicle_loads
-
+# ------------------- HELPERS -------------------
 
 def _find_simple_allocation(order, inventory, warehouses, skus, max_warehouses=2):
     """
-    Try single warehouse, else split across up to max_warehouses.
+    Quick allocation: try single warehouse first, then split (up to max_warehouses).
+    Returns: [(warehouse_id, {sku_id: qty}), ...] covering full order; else [].
     """
     needed = dict(order.requested_items)
 
-    # Single warehouse
+    # Try single warehouse
     for wh_id, inv in inventory.items():
         if all(inv.get(sku_id, 0) >= qty for sku_id, qty in needed.items()):
             return [(wh_id, needed)]
@@ -320,76 +203,25 @@ def _find_simple_allocation(order, inventory, warehouses, skus, max_warehouses=2
             available = inv.get(sku_id, 0)
             if available <= 0:
                 continue
-            take = min(available, qty_needed)
-            if take > 0:
-                provided[sku_id] = take
-                new_qty = qty_needed - take
+            provide = min(available, qty_needed)
+            if provide > 0:
+                provided[sku_id] = provide
+                new_qty = qty_needed - provide
                 if new_qty <= 0:
                     to_delete.append(sku_id)
                 else:
                     remaining[sku_id] = new_qty
+
         for sid in to_delete:
             del remaining[sid]
+
         if provided:
             allocation.append((wh_id, provided))
+
         if not remaining:
             return allocation
 
-    return allocation if not remaining else []
-
-
-def _find_allocation_prefer_close(order, inventory, warehouses, skus, env, max_warehouses=2):
-    """
-    Prefer nearest single warehouse; else split across nearest warehouses (capped).
-    """
-    needed = dict(order.requested_items)
-    customer_node = order.destination.id
-
-    # Single warehouse candidates (closest first)
-    single_wh = []
-    for wh_id, inv in inventory.items():
-        if all(inv.get(sid, 0) >= qty for sid, qty in needed.items()):
-            wh_node = warehouses[wh_id].location.id
-            dist = _safe_dist(env, wh_node, customer_node)
-            single_wh.append((dist, wh_id))
-    if single_wh:
-        single_wh.sort()
-        return [(single_wh[0][1], needed)]
-
-    # Split across nearest warehouses (up to max_warehouses)
-    wh_order = []
-    for wh_id in inventory.keys():
-        wh_node = warehouses[wh_id].location.id
-        dist = _safe_dist(env, wh_node, customer_node)
-        wh_order.append((dist, wh_id))
-    wh_order.sort()
-
-    allocation, remaining = [], dict(needed)
-    for _, wh_id in wh_order:
-        if len(allocation) >= max_warehouses:
-            break
-        inv = inventory[wh_id]
-        provided, to_delete = {}, []
-        for sku_id, qty_needed in list(remaining.items()):
-            available = inv.get(sku_id, 0)
-            if available <= 0:
-                continue
-            take = min(available, qty_needed)
-            if take > 0:
-                provided[sku_id] = take
-                new_qty = qty_needed - take
-                if new_qty <= 0:
-                    to_delete.append(sku_id)
-                else:
-                    remaining[sku_id] = new_qty
-        for sid in to_delete:
-            del remaining[sid]
-        if provided:
-            allocation.append((wh_id, provided))
-        if not remaining:
-            return allocation
-
-    return allocation if not remaining else []
+    return []
 
 
 def _build_connected_route(env,
@@ -399,24 +231,20 @@ def _build_connected_route(env,
                            orders,
                            adjacency) -> Dict:
     """
-    Build route with safe connectivity and optimized delivery order.
+    Construct steps:
+    - Waypoints: home -> pickup warehouses -> order destinations -> home
+    - Between waypoints: insert shortest path nodes via Dijkstra over adjacency_list
+    - Operations only at actual warehouse/order nodes; travel steps are empty
     """
 
-    home_node = warehouses[vehicle.home_warehouse_id].location.id
+    # Resolve home node from vehicle home warehouse
+    home_wh = warehouses[vehicle.home_warehouse_id]
+    home_node = home_wh.location.id
+
     steps: List[Dict] = []
 
     def add_step(node_id: int):
         steps.append({'node_id': node_id, 'pickups': [], 'deliveries': [], 'unloads': []})
-
-    # Distance cache for Dijkstra
-    dist_cache = {}
-    def _edge_weight(u, v):
-        key = (u, v)
-        if key in dist_cache:
-            return dist_cache[key]
-        w = env.get_distance(u, v)
-        dist_cache[key] = w
-        return w
 
     def shortest_path(src: int, dst: int) -> Optional[List[int]]:
         if src == dst:
@@ -424,19 +252,14 @@ def _build_connected_route(env,
         heap = [(0.0, src)]
         dist = {src: 0.0}
         prev = {}
-        visited = set()
-
         while heap:
             d, u = heapq.heappop(heap)
-            if u in visited:
-                continue
-            visited.add(u)
-
             if u == dst:
                 break
-
-            for v in adjacency.get(u, []):
-                w = _edge_weight(u, v)
+            if d != dist.get(u, float('inf')):
+                continue
+            for v in adjacency.get(u, []):  # neighbors are node IDs
+                w = env.get_distance(u, v)   # edge weight
                 if w is None:
                     continue
                 nd = d + w
@@ -444,15 +267,10 @@ def _build_connected_route(env,
                     dist[v] = nd
                     prev[v] = u
                     heapq.heappush(heap, (nd, v))
-
         if dst not in dist:
             return None
-
-        # Reconstruct path
         path = [dst]
         while path[-1] != src:
-            if path[-1] not in prev:
-                return None
             path.append(prev[path[-1]])
         path.reverse()
         return path
@@ -468,10 +286,8 @@ def _build_connected_route(env,
             for sku_id, qty in items.items():
                 pickup_by_wh[wh_id][sku_id] += qty
 
-    # Visit warehouses (skip unreachable legs)
-    warehouse_list = list(pickup_by_wh.keys())
-    picked_anything = False
-    for wh_id in warehouse_list:
+    # Visit warehouses for pickups
+    for wh_id, sku_qty_map in pickup_by_wh.items():
         target_node = warehouses[wh_id].location.id
         if current_node != target_node:
             path = shortest_path(current_node, target_node)
@@ -480,34 +296,12 @@ def _build_connected_route(env,
             for node in path[1:]:
                 add_step(node)
             current_node = target_node
+        pickups = [{'warehouse_id': wh_id, 'sku_id': sku_id, 'quantity': qty}
+                   for sku_id, qty in sku_qty_map.items()]
+        steps[-1]['pickups'].extend(pickups)
 
-        pickups = [
-            {'warehouse_id': wh_id, 'sku_id': sku_id, 'quantity': qty}
-            for sku_id, qty in pickup_by_wh[wh_id].items()
-        ]
-        if pickups:
-            steps[-1]['pickups'].extend(pickups)
-            picked_anything = True
-
-    # If no pickups, go home
-    if not picked_anything:
-        if current_node != home_node:
-            path = shortest_path(current_node, home_node)
-            if path:
-                for node in path[1:]:
-                    add_step(node)
-        return {'vehicle_id': vehicle.id, 'steps': steps}
-
-    # Optimize deliveries: NN + cautious 2-opt
-    order_ids_optimized = _optimize_delivery_order_safe(assigned_orders, orders, warehouse_list, warehouses, home_node, env)
-
-    # Deliveries
-    alloc_map = {oid: alloc for oid, alloc in assigned_orders}
-    assigned_orders_opt = [(oid, alloc_map.get(oid, [])) for oid in order_ids_optimized]
-
-    for order_id, allocation in assigned_orders_opt:
-        if not allocation:
-            continue
+    # Deliver to each order
+    for order_id, allocation in assigned_orders:
         target_node = orders[order_id].destination.id
         if current_node != target_node:
             path = shortest_path(current_node, target_node)
@@ -516,13 +310,11 @@ def _build_connected_route(env,
             for node in path[1:]:
                 add_step(node)
             current_node = target_node
-
         deliveries = []
         for wh_id, items in allocation:
             for sku_id, qty in items.items():
                 deliveries.append({'order_id': order_id, 'sku_id': sku_id, 'quantity': qty})
-        if deliveries:
-            steps[-1]['deliveries'].extend(deliveries)
+        steps[-1]['deliveries'].extend(deliveries)
 
     # Return home
     if current_node != home_node:
@@ -531,79 +323,7 @@ def _build_connected_route(env,
             for node in path[1:]:
                 add_step(node)
 
-    if not steps or steps[0]['node_id'] != home_node:
-        return None
-
     return {'vehicle_id': vehicle.id, 'steps': steps}
-
-
-def _optimize_delivery_order_safe(assigned_orders, orders, warehouse_list, warehouses, home_node, env):
-    """
-    Nearest-neighbor + single 2-opt improvement (only for routes >= 6 deliveries).
-    """
-    if len(assigned_orders) <= 1:
-        return [oid for oid, _ in assigned_orders]
-
-    start_node = warehouses[warehouse_list[-1]].location.id if warehouse_list else home_node
-
-    # Pair distance cache
-    pair_cache = {}
-    def _pair_dist(a, b):
-        key = (a, b)
-        if key in pair_cache:
-            return pair_cache[key]
-        d = env.get_distance(a, b)
-        pair_cache[key] = d if d is not None else float('inf')
-        return pair_cache[key]
-
-    # Nearest neighbor
-    remaining = {oid for oid, _ in assigned_orders}
-    current = start_node
-    ordered = []
-    while remaining:
-        best_order = None
-        best_dist = float('inf')
-        for oid in remaining:
-            order_node = orders[oid].destination.id
-            d = _pair_dist(current, order_node)
-            if d < best_dist:
-                best_dist = d
-                best_order = oid
-        if best_order is None:
-            ordered.extend([oid for oid, _ in assigned_orders if oid in remaining])
-            break
-        ordered.append(best_order)
-        remaining.remove(best_order)
-        current = orders[best_order].destination.id
-
-    # Single 2-opt improvement (routes >= 6)
-    if len(ordered) < 6:
-        return ordered
-
-    def route_distance(seq, start):
-        dist = 0.0
-        cur = start
-        for oid in seq:
-            dst = orders[oid].destination.id
-            dist += _pair_dist(cur, dst)
-            cur = dst
-        return dist
-
-    base = route_distance(ordered, start_node)
-    improved_once = False
-    for i in range(1, len(ordered) - 2):
-        for j in range(i + 1, len(ordered)):
-            candidate = ordered[:i] + ordered[i:j][::-1] + ordered[j:]
-            cd = route_distance(candidate, start_node)
-            if cd + 1e-6 < base:
-                ordered = candidate
-                base = cd
-                improved_once = True
-                break
-        if improved_once:
-            break
-
-    return ordered
 #from robin_logistics import LogisticsEnvironment
 #env = LogisticsEnvironment()
 #result = solver(env)
