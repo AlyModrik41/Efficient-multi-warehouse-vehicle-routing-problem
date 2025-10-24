@@ -72,21 +72,7 @@ Our solver intelligently assigns orders, builds feasible routes, and minimizes o
 🧠 Solver Logic
 
                                                                                                                                                                                                                                                   
-│ Load Environment Data  │
-           ↓                                                                                                                                                                                                                        
-│ Allocate Orders        │                                                                                                                                                                                                                                                
-│ (multi-warehouse)      │                                                                                                                                                                                                                                                
-           ↓                                                                                                                                                                                                                                                                
-│ Vehicle Assignment     │                                                                                                                                                                                                                                                
-│ (greedy + capacity)    │
-           ↓
-│ Build Connected Routes │                                                                                                                                                                                                                                                
-│ (memoized Dijkstra)    │
-           ↓
-│ Retry Unassigned Orders│                                                                                                                                                                                                                                        
-│ (3-pass adaptive fix)  │                                                                                                                                                                                                                                                
-           ↓
-│ Validate + Score       │
+│ Load Environment Data  │ -> │ Allocate Orders │ -> │ (multi-warehouse)│ -> │ Vehicle Assignment │ -> │(greedy + capacity)│ -> │ Build Connected Routes │ -> │(memoized Dijkstra)│ -> │ Retry Unassigned Orders │ -> │(3-pass adaptive fix)│ -> │ Validate + Score │
 
 ## 🧩 Environment Overview
 
