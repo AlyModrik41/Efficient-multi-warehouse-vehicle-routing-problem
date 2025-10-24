@@ -1,48 +1,68 @@
 #!/usr/bin/env python3
 """
-MWVRP Solver: fewer vehicles, lower cost, safe routing
-- Aggressive packing: fill existing vehicles up to 95% before opening new ones
+MWVRP Solver: 100% fulfillment, minimal vehicles, lowest cost & distance
+- K-means clustering: groups orders geographically to reduce routes  
+- Aggressive packing: fill existing vehicles up to 99% before opening new ones
 - Two-phase consolidation: close lightly loaded vehicles (cuts fixed costs)
 - Distance-aware allocation capped at 2 warehouses (fewer pickup detours)
 - Road-connected routing: Dijkstra with distance caching and connectivity guards
 - Delivery sequencing: nearest-neighbor + cautious 2-opt (only for long routes)
 - Auto-tuning tries vehicle-minimizing variants and picks the best
+- Priority: 100% fulfillment > minimize cost > minimize distance
 """
 
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import heapq
 import random
+import math
 
 
 # ===================== ENTRY POINT =====================
 
 def solver(env) -> Dict:
     """
-    Auto-tunes conservative parameter sets that minimize vehicles while keeping fulfillment.
+    Auto-tunes conservative parameter sets targeting 100% fulfillment,
+    minimal vehicles, lowest cost and distance.
     """
 
+    # Extended parameter grid with clustering to reduce routes
     param_grid = [
-    {"capacity_buffer": 1.0, "max_warehouses": 2, "order_strategy": "nearest",
-     "consolidate": True, "max_orders_per_vehicle": 25, "pack_threshold": 0.99},
-    {"capacity_buffer": 1.0, "max_warehouses": 2, "order_strategy": "largest",
-     "consolidate": True, "max_orders_per_vehicle": 22, "pack_threshold": 0.98},
-]
-
+        # Clustering with target routes to minimize vehicles
+        {"target_routes": 6, "capacity_buffer": 1.00, "max_warehouses": 2,
+         "order_strategy": "nearest", "pack_threshold": 0.99,
+         "max_orders_per_vehicle": 26, "consolidate": True, "use_clustering": True},
+        {"target_routes": 7, "capacity_buffer": 1.00, "max_warehouses": 2,
+         "order_strategy": "nearest", "pack_threshold": 0.99,
+         "max_orders_per_vehicle": 24, "consolidate": True, "use_clustering": True},
+        {"target_routes": 6, "capacity_buffer": 0.98, "max_warehouses": 2,
+         "order_strategy": "largest", "pack_threshold": 0.99,
+         "max_orders_per_vehicle": 26, "consolidate": True, "use_clustering": True},
+        # Fallback without clustering
+        {"target_routes": None, "capacity_buffer": 1.00, "max_warehouses": 2,
+         "order_strategy": "nearest", "pack_threshold": 0.99,
+         "max_orders_per_vehicle": 25, "consolidate": True, "use_clustering": False},
+        {"target_routes": None, "capacity_buffer": 1.00, "max_warehouses": 2,
+         "order_strategy": "largest", "pack_threshold": 0.98,
+         "max_orders_per_vehicle": 22, "consolidate": True, "use_clustering": False},
+    ]
 
     best_solution = None
     best_score = float("inf")
+    best_metrics = None
 
     for params in param_grid:
         env.reset_all_state()
         solution = base_solver(
             env,
+            target_routes=params.get("target_routes"),
             capacity_buffer=params["capacity_buffer"],
             max_warehouses=params["max_warehouses"],
             order_strategy=params["order_strategy"],
             max_orders_per_vehicle=params["max_orders_per_vehicle"],
             pack_threshold=params["pack_threshold"],
             consolidate=params["consolidate"],
+            use_clustering=params.get("use_clustering", False),
         )
 
         # Validate
@@ -60,26 +80,118 @@ def solver(env) -> Dict:
         requested = stats.get("total_items_requested", 0)
         delivered = stats.get("total_items_delivered", 0)
         fulfillment_rate = delivered / max(1, requested)
+        
+        # Calculate total distance
+        total_distance = 0.0
+        for route in solution.get("routes", []):
+            steps = route.get("steps", [])
+            for i in range(len(steps) - 1):
+                node1 = steps[i]["node_id"]
+                node2 = steps[i + 1]["node_id"]
+                dist = env.get_distance(node1, node2)
+                if dist is not None:
+                    total_distance += dist
 
-        # Score: fulfillment first, then cost
-        score = cost * (1 + max(0.0, 1.0 - fulfillment_rate) * 60.0)
+        # Score: Prioritize 100% fulfillment, then minimize cost, then distance
+        # Heavy penalty for incomplete fulfillment
+        fulfillment_penalty = max(0.0, 1.0 - fulfillment_rate) * 1000000.0
+        # Normalize distance to similar scale as cost
+        distance_factor = total_distance * 0.1
+        score = fulfillment_penalty + cost + distance_factor
 
         if score < best_score:
             best_score = score
             best_solution = solution
+            best_metrics = {
+                "fulfillment_rate": fulfillment_rate,
+                "cost": cost,
+                "distance": total_distance,
+                "routes": len(solution.get("routes", [])),
+                "params": params
+            }
 
     return best_solution if best_solution else {"routes": []}
+
+
+# ===================== CLUSTERING =====================
+
+def kmeans_cluster_nodes(order_nodes: Dict[str, int], k: int, env) -> List[List[str]]:
+    """
+    Simple k-means on order destination nodes using pairwise distances (Lloyd's algorithm).
+    Returns k clusters of order IDs. If k >= number of orders, each order is its own cluster.
+    """
+    oids = list(order_nodes.keys())
+    if k >= len(oids) or k <= 1:
+        return [oids] if k == 1 else [[oid] for oid in oids]
+
+    # Initialize centers with k evenly spaced orders
+    centers = [order_nodes[oid] for oid in oids[::max(1, len(oids)//k)][:k]]
+
+    def dist(a_node, b_node):
+        d = env.get_distance(a_node, b_node)
+        return d if d is not None else float('inf')
+
+    for _ in range(10):  # few iterations for speed
+        # Assign
+        clusters = [[] for _ in range(k)]
+        for oid in oids:
+            onode = order_nodes[oid]
+            # choose nearest center
+            best_i, best_d = 0, dist(onode, centers[0])
+            for i in range(1, k):
+                di = dist(onode, centers[i])
+                if di < best_d:
+                    best_i, best_d = i, di
+            clusters[best_i].append(oid)
+
+        # Recompute centers (medoid: choose member with minimum total distance to others)
+        new_centers = []
+        for i, cluster in enumerate(clusters):
+            if not cluster:
+                # if empty, keep previous center
+                new_centers.append(centers[i] if i < len(centers) else centers[0])
+                continue
+            nodes = [order_nodes[oid] for oid in cluster]
+            # pick node minimizing sum distance to others
+            best_node, best_sum = nodes[0], float('inf')
+            for n in nodes:
+                s = 0.0
+                for m in nodes:
+                    s += dist(n, m)
+                if s < best_sum:
+                    best_sum = s
+                    best_node = n
+            new_centers.append(best_node)
+        # stop if centers stable
+        if len(new_centers) == len(centers) and all(new_centers[i] == centers[i] for i in range(len(centers))):
+            break
+        centers = new_centers
+
+    # Final assignment
+    clusters = [[] for _ in range(k)]
+    for oid in oids:
+        onode = order_nodes[oid]
+        best_i, best_d = 0, dist(onode, centers[0])
+        for i in range(1, k):
+            di = dist(onode, centers[i])
+            if di < best_d:
+                best_i, best_d = i, di
+        clusters[best_i].append(oid)
+    # Remove empties
+    return [c for c in clusters if c]
 
 
 # ===================== BASE SOLVER =====================
 
 def base_solver(env,
+                target_routes: Optional[int] = None,
                 capacity_buffer: float = 1.00,
                 max_warehouses: int = 2,
                 order_strategy: str = "nearest",
                 max_orders_per_vehicle: int = 18,
                 pack_threshold: float = 0.95,
-                consolidate: bool = True) -> Dict:
+                consolidate: bool = True,
+                use_clustering: bool = False) -> Dict:
     """
     Vehicle-minimizing greedy solver with consolidation and optimized routing.
     """
@@ -107,20 +219,55 @@ def base_solver(env,
     # Track vehicle loads and assigned orders
     vehicle_loads = {v.id: {'weight': 0.0, 'volume': 0.0, 'orders': []} for v in vehicles_list}
 
-    # Order sorting (proximity or largest first)
-    order_items = list(orders.items())
-    if order_strategy == "largest":
-        order_items.sort(
-            key=lambda kv: sum(skus[s].weight * q for s, q in kv[1].requested_items.items()),
-            reverse=True
-        )
-    elif order_strategy == "nearest":
-        base_home_node = warehouses[vehicles_list[0].home_warehouse_id].location.id if vehicles_list else None
-        order_items.sort(
-            key=lambda kv: _safe_dist(env, base_home_node, kv[1].destination.id) if base_home_node is not None else 0.0
-        )
-    elif order_strategy == "random":
-        random.shuffle(order_items)
+    # Order clustering or sorting
+    all_order_ids = list(orders.keys())
+    if not all_order_ids:
+        return {"routes": []}
+    
+    if use_clustering and target_routes is not None and target_routes > 0:
+        # Use k-means clustering to group orders geographically
+        order_nodes = {oid: orders[oid].destination.id for oid in all_order_ids}
+        clusters = kmeans_cluster_nodes(order_nodes, k=target_routes, env=env)
+        
+        # Sort within each cluster
+        def order_weight(o):
+            return sum(skus[s].weight * q for s, q in orders[o].requested_items.items())
+        
+        clustered_order_lists = []
+        for cluster in clusters:
+            if order_strategy == "largest":
+                clustered_order_lists.append(sorted(cluster, key=order_weight, reverse=True))
+            elif order_strategy == "nearest":
+                base_home_node = warehouses[vehicles_list[0].home_warehouse_id].location.id if vehicles_list else None
+                clustered_order_lists.append(sorted(cluster,
+                    key=lambda oid: _safe_dist(env, base_home_node, orders[oid].destination.id) if base_home_node is not None else 0.0))
+            elif order_strategy == "random":
+                c = list(cluster)
+                random.shuffle(c)
+                clustered_order_lists.append(c)
+            else:
+                clustered_order_lists.append(list(cluster))
+        
+        # Flatten clusters into order_items
+        order_items = []
+        for cluster_orders in clustered_order_lists:
+            for oid in cluster_orders:
+                order_items.append((oid, orders[oid]))
+    else:
+        # Original sorting without clustering
+        order_items = list(orders.items())
+        if order_strategy == "largest":
+            order_items.sort(
+                key=lambda kv: sum(skus[s].weight * q for s, q in kv[1].requested_items.items()),
+                reverse=True
+            )
+        elif order_strategy == "nearest":
+            base_home_node = warehouses[vehicles_list[0].home_warehouse_id].location.id if vehicles_list else None
+            order_items.sort(
+                key=lambda kv: _safe_dist(env, base_home_node, kv[1].destination.id) if base_home_node is not None else 0.0
+            )
+        elif order_strategy == "random":
+            random.shuffle(order_items)
 
     # Assign: pack into existing vehicles before opening new ones
     for order_id, order in order_items:
@@ -189,7 +336,7 @@ def base_solver(env,
     if consolidate:
         vehicle_loads = consolidate_vehicles(vehicles_list, vehicle_loads, orders, skus, capacity_buffer)
         vehicle_loads = consolidate_small_fleets(vehicles_list, vehicle_loads, orders, skus,
-                                                 capacity_buffer, max_orders_threshold=3)
+                                                 capacity_buffer, max_orders_threshold=4)
 
     # Build connected routes
     solution = {"routes": []}
@@ -260,9 +407,10 @@ def consolidate_vehicles(vehicles_list, vehicle_loads, orders, skus, capacity_bu
 
 
 def consolidate_small_fleets(vehicles_list, vehicle_loads, orders, skus,
-                             capacity_buffer=1.0, max_orders_threshold=3):
+                             capacity_buffer=1.0, max_orders_threshold=4):
     """
     Close vehicles with few orders (<= threshold) by moving their orders to other vehicles.
+    Allows slightly more capacity (up to 1.2x buffer) to reduce total vehicles.
     """
     donors = [v for v in vehicles_list if len(vehicle_loads[v.id]['orders']) <= max_orders_threshold
               and vehicle_loads[v.id]['orders']]
@@ -276,14 +424,15 @@ def consolidate_small_fleets(vehicles_list, vehicle_loads, orders, skus,
             o_weight = sum(skus[s].weight * q for s, q in o.requested_items.items())
             o_volume = sum(skus[s].volume * q for s, q in o.requested_items.items())
 
+            # Try to find a recipient vehicle that can take this order
             for recipient in vehicles_list:
                 if recipient.id == donor.id:
                     continue
                 r_load = vehicle_loads[recipient.id]
-                if (r_load['weight'] + o_weight <= recipient.capacity_weight * capacity_buffer * 1.5 and
-    r_load['volume'] + o_volume <= recipient.capacity_volume * capacity_buffer * 1.5):
-    # move order
-
+                # Allow up to 1.2x capacity for consolidation (reduces vehicles)
+                if (r_load['weight'] + o_weight <= recipient.capacity_weight * capacity_buffer * 1.2 and
+                    r_load['volume'] + o_volume <= recipient.capacity_volume * capacity_buffer * 1.2):
+                    # move order
                     r_load['orders'].append((oid, alloc))
                     r_load['weight'] += o_weight
                     r_load['volume'] += o_volume
@@ -604,7 +753,3 @@ def _optimize_delivery_order_safe(assigned_orders, orders, warehouse_list, wareh
             break
 
     return ordered
-#from robin_logistics import LogisticsEnvironment
-#env = LogisticsEnvironment()
-#result = solver(env)
-#print(f"Generated {len(result['routes'])} routes")
