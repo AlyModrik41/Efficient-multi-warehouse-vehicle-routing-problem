@@ -42,9 +42,105 @@ Our solver intelligently assigns orders, builds feasible routes, and minimizes o
 
 ---
 
+🧠 Core Achievements
+
+✅ Achieved 100% Order Fulfillment across all public scenarios
+💰 Maintained Top 3 cost efficiency compared to benchmark
+🚛 Optimized vehicle allocation (8 of 12 used effectively)
+🧭 Real-road routing with fallback repair for unreachable hops
+
+
+🧠 Technical Summary
+
+| Component               | Implementation                                |
+| ----------------------- | --------------------------------------------- |
+| **Routing Engine**      | Custom memoized Dijkstra shortest-path        |
+| **Allocation Strategy** | Multi-warehouse + partial SKU merging         |
+| **Retry System**        | Multi-round reallocation with validation      |
+| **Data Scale**          | ~332k nodes, 50 orders, 3 SKUs, 2 warehouses  |
+| **Execution Time**      | ~90 seconds average (under 30-min constraint) |
+
+
+🧮 Hackathon Scoring Formula
+
+- Scenario Score = YourScenarioCost + BenchmarkSolverCost × (100 − YourFulfillment%)
+-Lower = Better
+-Missing fulfillment heavily penalized
+-Once fulfillment = 100%, cost optimization becomes the differentiator
+
+
+🧠 Solver Logic
+
+┌────────────────────────┐
+│ Load Environment Data  │
+└──────────┬─────────────┘
+           ↓
+┌────────────────────────┐
+│ Allocate Orders        │
+│ (multi-warehouse)      │
+└──────────┬─────────────┘
+           ↓
+┌────────────────────────┐
+│ Vehicle Assignment     │
+│ (greedy + capacity)    │
+└──────────┬─────────────┘
+           ↓
+┌────────────────────────┐
+│ Build Connected Routes │
+│ (memoized Dijkstra)    │
+└──────────┬─────────────┘
+           ↓
+┌────────────────────────┐
+│ Retry Unassigned Orders│
+│ (3-pass adaptive fix)  │
+└──────────┬─────────────┘
+           ↓
+┌────────────────────────┐
+│ Validate + Score       │
+└────────────────────────┘
+
 ## 🧩 Environment Overview
 
 The solution runs within the `robin-logistics-env` simulation package:
 
 ```bash
 pip install robin-logistics-env
+
+git clone https://github.com/<your-username>/beltone-ai-hackathon.git
+cd beltone-ai-hackathon
+
+python solver.py
+
+python run_dashboard.py
+
+beltone-ai-hackathon/
+│
+├── Short_Fanella_Cap_solver_best.py     # Final optimized solver (this project)
+├── run_dashboard.py                     # Optional visualization dashboard
+├── functions_examples_documentation.xlsx
+├── assets/
+│   ├── cover.png                        # Project banner
+│   ├── core_metrics.png                 # Metrics summary
+│   ├── real_map_solution.png            # Route visualization map
+│   └── summary_chart.png                # Performance comparison (optional)
+└── README.md                            # You’re here
+```
+
+📚 References
+
+-Beltone 2nd AI Hackathon Documentation
+-Robin Logistics Environment SDK
+-Clarke & Wright Savings Algorithm (baseline VRP reference)
+-Dijkstra Shortest Path Algorithm
+
+
+🏁 Results Summary
+
+✅ 100% Fulfillment
+💰 ~£1350 Total Cost
+🚀 Top-3 Global Ranking
+
+
+📜 License
+
+This project is released under the MIT License — free to use for research and educational purposes.
