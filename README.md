@@ -3,7 +3,6 @@
 ![Fulfillment 100%](https://img.shields.io/badge/Fulfillment-100%25-brightgreen)
 ![Cost £1350](https://img.shields.io/badge/Total%20Cost-£1350-blue)
 ![Python 3.10](https://img.shields.io/badge/Python-3.10-yellow)
-![Top 100](https://img.shields.io/badge/Leaderboard-Top%203-orange)
 
 
 ---
