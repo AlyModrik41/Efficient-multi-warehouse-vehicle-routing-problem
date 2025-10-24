@@ -52,9 +52,13 @@ Our solver intelligently assigns orders, builds feasible routes, and minimizes o
 
 🧠 Technical Summary
 
-| Component               | Implementation                                |                                                                                                                                                                                            
-| ----------------------- | --------------------------------------------- |                                                                                                                                                                                        
-| **Routing Engine**      | Custom memoized Dijkstra shortest-path        |                                                                                                                                                                                                   | **Allocation Strategy** | Multi-warehouse + partial SKU merging         |                                                                                                                                                                                                  | **Retry System**        | Multi-round reallocation with validation      |                                                                                                                                                                                                  | **Data Scale**          | ~332k nodes, 50 orders, 3 SKUs, 2 warehouses  |                                                                                                                                                                                                  | **Execution Time**      | ~90 seconds average (under 30-min constraint) |
+| Component               | Implementation                                |
+| ----------------------- | --------------------------------------------- |
+| **Routing Engine**      | Custom memoized Dijkstra shortest-path        |
+| **Allocation Strategy** | Multi-warehouse + partial SKU merging         |
+| **Retry System**        | Multi-round reallocation with validation      |
+| **Data Scale**          | ~332k nodes, 50 orders, 3 SKUs, 2 warehouses  |
+| **Execution Time**      | ~90 seconds average (under 30-min constraint) |
 
 
 🧮 Hackathon Scoring Formula
